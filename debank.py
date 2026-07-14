@@ -23,13 +23,13 @@ TLS fingerprinting:
 Usage:
   from debank import DebankClient
 
-  client = DebankClient("0xYourAddress")
+  client = DebankClient("0xYourAddress", name="Main Wallet")  # name optional
   result = client.fetch_all()          # spot + DeFi combined
   tokens = client.fetch_tokens()       # spot balances only
   defi   = client.fetch_protocols()    # DeFi positions only
 
 Standalone test:
-  python debank.py <0x_address>
+  python debank.py <0x_address> [name]
 """
 
 from dataclasses import dataclass, field
@@ -77,9 +77,10 @@ class Position:
 
 @dataclass
 class Result:
-    address: str
+    address: str          # original casing (EIP-55) as passed to the client
     positions: list
     total_usd: float
+    name: str = ""        # wallet label — custom name or "DeBank <address>"
 
 
 # ---------------------------------------------------------------------------
@@ -193,8 +194,10 @@ class DebankClient:
     No API key required — uses the reverse-engineered signing algorithm.
     """
 
-    def __init__(self, address: str):
-        self.address = address.lower()
+    def __init__(self, address: str, name: str = None):
+        self.address = address.lower()   # normalized for API params
+        self.display_address = address   # original casing (EIP-55)
+        self.name = name  # optional wallet label; None → "DeBank <address>"
         self._session = _make_session()
 
     # ------------------------------------------------------------------
@@ -239,7 +242,8 @@ class DebankClient:
     def fetch_all(self) -> Result:
         """Fetch spot token balances and DeFi positions, return combined result."""
         short = f"{self.address[:6]}...{self.address[-4:]}"
-        print(f"  DeBank {short}  ", end="", flush=True)
+        label = self.name or f"DeBank {self.address}"
+        print(f"  {self.name or 'DeBank'} {short}  ", end="", flush=True)
 
         try:
             spot_positions  = self.fetch_tokens()
@@ -247,9 +251,10 @@ class DebankClient:
         except Exception as e:
             print(f"[error: {e}]")
             return Result(
-                address=self.address,
+                address=self.display_address,
                 positions=[],
                 total_usd=0.0,
+                name=label,
             )
 
         positions = sorted(
@@ -264,9 +269,10 @@ class DebankClient:
             f"across {prot} protocols  (${total:,.2f})"
         )
         return Result(
-            address=self.address,
+            address=self.display_address,
             positions=positions,
             total_usd=total,
+            name=label,
         )
 
     def fetch_tokens(self) -> list:
@@ -399,10 +405,11 @@ class DebankClient:
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python debank.py <0x_address>")
+        print("Usage: python debank.py <0x_address> [name]")
         sys.exit(1)
 
     address = sys.argv[1]
+    name    = sys.argv[2] if len(sys.argv) > 2 else None
 
     if _HAS_CFFI:
         print("TLS: curl_cffi (Chrome fingerprint)")
@@ -412,7 +419,7 @@ if __name__ == "__main__":
 
     print(f"Fetching DeBank positions (spot + DeFi) for {address}...\n")
 
-    client = DebankClient(address)
+    client = DebankClient(address, name=name)
     result = client.fetch_all()
 
     if not result.positions:
