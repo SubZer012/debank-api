@@ -305,7 +305,7 @@ class DebankClient:
             spot_positions  = self.fetch_tokens()
             defi_positions  = self.fetch_protocols()
         except Exception as e:
-            print(f"[FAILED: {e}]")
+            print(f"[FAILED: {e}]", flush=True)
             return Result(
                 address=self.display_address,
                 positions=[],
@@ -324,7 +324,8 @@ class DebankClient:
         prot  = len({p.protocol for p in defi_positions})
         print(
             f"{len(spot_positions)} tokens, {len(defi_positions)} DeFi positions "
-            f"across {prot} protocols  (${total:,.2f})"
+            f"across {prot} protocols  (${total:,.2f})",
+            flush=True,
         )
         return Result(
             address=self.display_address,
@@ -503,7 +504,8 @@ def fetch_wallets(
             print(
                 f"\n  {len(pending)} wallet(s) failed — waiting {retry_wait / 60:.0f} min "
                 f"for DeBank's rate limit to decay, then retrying "
-                f"(round {round_no} of {retry_rounds})..."
+                f"(round {round_no} of {retry_rounds})...",
+                flush=True,
             )
             _sleep(retry_wait)
 
@@ -525,7 +527,8 @@ def fetch_wallets(
                     if skipped:
                         print(
                             f"\n  {consecutive} wallets failed in a row — DeBank is "
-                            f"blocking this IP. Skipping {len(skipped)} wallet(s) this round."
+                            f"blocking this IP. Skipping {len(skipped)} wallet(s) this round.",
+                            flush=True,
                         )
                     for skip_idx in skipped:
                         skip_address, skip_name = entries[skip_idx]
