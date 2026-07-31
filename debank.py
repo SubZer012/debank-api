@@ -81,6 +81,12 @@ class Result:
     positions: list
     total_usd: float
     name: str = ""        # wallet label — custom name or "DeBank <address>"
+    # False when the fetch failed. A failed fetch yields total_usd=0.0, which is
+    # indistinguishable from a genuinely empty wallet — callers MUST check this
+    # before treating total_usd as real, or a rate-limited wallet silently
+    # contributes $0 to whatever the caller is totalling.
+    ok: bool = True
+    error: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +95,46 @@ class Result:
 
 BASE_URL = "https://api.debank.com"
 DUST_THRESHOLD_USD = 10.0
+
+# --- Rate limiting -----------------------------------------------------------
+#
+# Measured behaviour of /portfolio/project_list (2026-07-30). Note that
+# /token/cache_balance_list never 429s, even at zero delay across ~40 calls:
+#   - 429s ({"error_code":429,"error_msg":"Request too fast..."}) occur even from
+#     a cold IP with zero prior requests — ~27% of calls (6/22 on first contact).
+#   - The 429 rate does NOT fall as requests are spaced further apart: identical
+#     at 0s, 1s and 3s gaps, and 11/11 still failed at 15s spacing once throttled.
+#     Adding delay does not prevent them.
+#   - The rate CLIMBS with cumulative call volume per IP until every request is
+#     refused — a depleting quota / soft block, not a per-request speed limit.
+#     Observed within one session: 4/11 -> 8/11 -> 11/11 failures.
+#   - Retrying harder makes it worse: raising attempts 3 -> 6 took failures from
+#     4/11 to 8/11, because each retry spends the quota causing the failure.
+#   - The block is transient — a single call recovered ~5 min after traffic
+#     stopped — but a multi-wallet run still draws the baseline failure rate.
+#
+# Therefore: keep in-process attempts LOW and fail fast, then retry the whole run
+# later (see RUN_RETRY_* below). Do not "fix" 429s by adding delay or attempts.
+RATE_LIMIT_MAX_ATTEMPTS = 2
+RATE_LIMIT_BACKOFF_SEC = 1.0
+
+# Connection/transport errors are a different failure class — those do benefit
+# from real exponential backoff.
+CONNECTION_MAX_ATTEMPTS = 3
+
+# Pause between wallets. Does NOT prevent 429s; only keeps the burst gentle so
+# the per-IP quota depletes more slowly.
+WALLET_DELAY_SEC = 3.0
+
+# Give up on the current pass once this many wallets fail back to back — when
+# DeBank is blocking, further calls cannot succeed and only burn quota.
+CONSECUTIVE_FAILURE_LIMIT = 3
+
+# Run-level retry. Because the block decays with time and not with spacing, the
+# effective recovery strategy is to wait minutes and re-attempt only the wallets
+# that failed. This is what makes a scheduled run survive normal 429 noise.
+RUN_RETRY_ROUNDS = 3
+RUN_RETRY_WAIT_SEC = 300
 
 # DeBank's position "name" field → internal position_type
 DEBANK_TYPE_MAP = {
@@ -209,7 +255,12 @@ class DebankClient:
         qs  = urlencode(sorted(params.items(), reverse=True)) if params else ""
         url = f"{BASE_URL}{path}?{qs}" if qs else f"{BASE_URL}{path}"
 
-        for attempt in range(3):
+        # 429s and connection errors are counted separately: different causes,
+        # different backoff (see constants above).
+        rate_limited = 0
+        conn_errors = 0
+
+        while rate_limited < RATE_LIMIT_MAX_ATTEMPTS and conn_errors < CONNECTION_MAX_ATTEMPTS:
             headers = _build_headers("GET", path, qs)
             try:
                 resp = self._session.get(
@@ -218,22 +269,27 @@ class DebankClient:
                     timeout=30,
                 )
             except Exception as e:
-                if attempt == 2:
+                conn_errors += 1
+                if conn_errors >= CONNECTION_MAX_ATTEMPTS:
                     raise
                 print(f"\n  [debank] Connection error ({e}), retrying...", end="", flush=True)
-                time.sleep(2 ** attempt)
+                time.sleep(2 ** conn_errors)
                 continue
 
             if resp.status_code == 429:
-                wait = 2 ** attempt
-                print(f"\n  [debank] Rate limited, retrying in {wait}s...", end="", flush=True)
-                time.sleep(wait)
+                rate_limited += 1
+                if rate_limited >= RATE_LIMIT_MAX_ATTEMPTS:
+                    break
+                time.sleep(RATE_LIMIT_BACKOFF_SEC)
                 continue
 
             resp.raise_for_status()
             return resp.json()
 
-        raise RuntimeError("DeBank request failed after 3 attempts")
+        raise RuntimeError(
+            f"DeBank {path} failed: rate limited {rate_limited}x "
+            f"(429 'Request too fast'), {conn_errors} connection error(s)"
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -249,12 +305,14 @@ class DebankClient:
             spot_positions  = self.fetch_tokens()
             defi_positions  = self.fetch_protocols()
         except Exception as e:
-            print(f"[error: {e}]")
+            print(f"[FAILED: {e}]")
             return Result(
                 address=self.display_address,
                 positions=[],
                 total_usd=0.0,
                 name=label,
+                ok=False,
+                error=str(e),
             )
 
         positions = sorted(
@@ -397,6 +455,99 @@ class DebankClient:
                 ],
             },
         )
+
+
+# ---------------------------------------------------------------------------
+# Multi-wallet fetch with run-level retry
+# ---------------------------------------------------------------------------
+
+def fetch_wallets(
+    wallets,
+    delay: float = WALLET_DELAY_SEC,
+    consecutive_limit: int = CONSECUTIVE_FAILURE_LIMIT,
+    retry_rounds: int = RUN_RETRY_ROUNDS,
+    retry_wait: float = RUN_RETRY_WAIT_SEC,
+    _sleep=time.sleep,
+):
+    """
+    Fetch many wallets, retrying only the ones that failed.
+
+    DeBank's 429s are common even on a healthy IP and are not avoidable by
+    spacing requests (see the rate-limiting notes at the top of this module).
+    They do decay with time, so the working strategy is: make one gentle pass,
+    then wait minutes and re-attempt only the failures.
+
+    wallets: iterable of plain address strings, or (address, name) pairs.
+    Returns list[Result] in the original input order. Check `.ok` on each —
+    a failed Result carries total_usd=0.0 and must not be treated as real.
+
+    `_sleep` is injectable so tests don't have to wait.
+    """
+    entries = []
+    for w in wallets:
+        if isinstance(w, (tuple, list)):
+            address, name = (list(w) + [None])[:2]
+        elif isinstance(w, dict):
+            address, name = w.get("address"), w.get("name")
+        else:
+            address, name = w, None
+        if not address:
+            raise ValueError(f"Wallet entry is missing an address: {w!r}")
+        entries.append((address, name))
+
+    results = [None] * len(entries)
+    pending = list(range(len(entries)))
+
+    for round_no in range(retry_rounds + 1):
+        if round_no:
+            print(
+                f"\n  {len(pending)} wallet(s) failed — waiting {retry_wait / 60:.0f} min "
+                f"for DeBank's rate limit to decay, then retrying "
+                f"(round {round_no} of {retry_rounds})..."
+            )
+            _sleep(retry_wait)
+
+        consecutive = 0
+        still_failing = []
+
+        for n, idx in enumerate(pending):
+            address, name = entries[idx]
+            result = DebankClient(address, name=name).fetch_all()
+            results[idx] = result
+
+            if result.ok:
+                consecutive = 0
+            else:
+                still_failing.append(idx)
+                consecutive += 1
+                if consecutive >= consecutive_limit:
+                    skipped = pending[n + 1:]
+                    if skipped:
+                        print(
+                            f"\n  {consecutive} wallets failed in a row — DeBank is "
+                            f"blocking this IP. Skipping {len(skipped)} wallet(s) this round."
+                        )
+                    for skip_idx in skipped:
+                        skip_address, skip_name = entries[skip_idx]
+                        results[skip_idx] = Result(
+                            address=skip_address,
+                            positions=[],
+                            total_usd=0.0,
+                            name=skip_name or f"DeBank {skip_address}",
+                            ok=False,
+                            error="skipped — DeBank blocking this IP",
+                        )
+                    still_failing.extend(skipped)
+                    break
+
+            if delay and n < len(pending) - 1:
+                _sleep(delay)
+
+        pending = still_failing
+        if not pending:
+            break
+
+    return results
 
 
 # ---------------------------------------------------------------------------
