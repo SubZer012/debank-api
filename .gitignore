@@ -5,9 +5,8 @@ __pycache__/
 venv/
 *.egg-info/
 
-# Claude Code — personal, machine-specific overrides.
-# A shared .claude/settings.json may be committed; settings.local.json is local.
-.claude/settings.local.json
+
+*.claude/settings.local.json
 
 # Secrets and local config — never commit these
 .env
