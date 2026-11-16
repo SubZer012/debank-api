@@ -159,6 +159,11 @@ DEBANK_TYPE_MAP = {
 # Signing
 # ---------------------------------------------------------------------------
 
+def _signed_query(params: dict) -> str:
+    """Canonical signing query: ascending keys and raw (not URL-encoded) values."""
+    return "&".join(f"{key}={value}" for key, value in sorted(params.items()))
+
+
 def _sign(method: str, path: str, qs: str, nonce: str, ts: int) -> str:
     """
     Compute x-api-sign for api.debank.com requests.
@@ -183,7 +188,7 @@ def _sign(method: str, path: str, qs: str, nonce: str, ts: int) -> str:
     sha256() returns a Buffer, so the second sha256 takes raw bytes as input.
     Using hexdigest() for h1 produces a wrong signature (was the original bug).
 
-    qs is the pre-built query string (no leading '?'), reverse-sorted by key.
+    qs is the pre-built query string (no leading '?'), ascending keys, raw values.
     """
     request_string = f"{method.upper()}\n{path}\n{qs}"
     key_string = f"debank-api\nn_{nonce}\n{ts}"
@@ -251,9 +256,10 @@ class DebankClient:
     # ------------------------------------------------------------------
 
     def _get(self, path: str, params: dict) -> any:
-        # Build query string once — used for both signing and the URL so they match exactly
-        qs  = urlencode(sorted(params.items(), reverse=True)) if params else ""
-        url = f"{BASE_URL}{path}?{qs}" if qs else f"{BASE_URL}{path}"
+        # Signing uses raw values; only the transport query is URL-encoded.
+        signed_qs = _signed_query(params)
+        url_qs = urlencode(params)
+        url = f"{BASE_URL}{path}?{url_qs}" if url_qs else f"{BASE_URL}{path}"
 
         # 429s and connection errors are counted separately: different causes,
         # different backoff (see constants above).
@@ -261,7 +267,7 @@ class DebankClient:
         conn_errors = 0
 
         while rate_limited < RATE_LIMIT_MAX_ATTEMPTS and conn_errors < CONNECTION_MAX_ATTEMPTS:
-            headers = _build_headers("GET", path, qs)
+            headers = _build_headers("GET", path, signed_qs)
             try:
                 resp = self._session.get(
                     url,
@@ -287,8 +293,8 @@ class DebankClient:
             return resp.json()
 
         raise RuntimeError(
-            f"DeBank {path} failed: rate limited {rate_limited}x "
-            f"(429 'Request too fast'), {conn_errors} connection error(s)"
+            f"DeBank {path} failed: received 429 {rate_limited}x "
+            f"(rate limit or bad signature), {conn_errors} connection error(s)"
         )
 
     # ------------------------------------------------------------------
